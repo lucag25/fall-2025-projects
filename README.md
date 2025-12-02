@@ -1,2 +1,2 @@
 # fall-2025-projects
-Academic and individual projects over Fall 2025
+Academic and independent projects over Fall 2025
