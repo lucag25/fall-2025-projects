@@ -1,0 +1,273 @@
+---
+title: "DATS 6101 Project 2 – Predicting Premier League Match Outcomes"
+author: "Group 4 - Ryan Jingwi, Luca Guerra"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: "hide"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(GGally)
+library(MASS)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+set.seed(123)
+```
+
+# Abstract
+
+In this second project, we build directly on the findings from Project 1, where we analyzed home field advantage in English Premier League soccer matches. While the first project focused primarily on describing patterns and testing statistical differences between home and away teams, the goal of this project is to move one step further and evaluate whether those patterns can be used to predict match outcomes. Using the same dataset, we develop and compare two predictive models: a logistic regression model and a classification tree model.
+
+Both models rely on commonly recorded in-game statistics such as shots, shots on target, corners, and disciplinary actions. These variables capture different aspects of match performance and provide a natural starting point for predictive modeling. By evaluating model performance on a held-out test set, we assess how well these statistics explain match results and highlight the strengths and limitations of each modeling approach.
+
+# Introduction
+
+Soccer matches are complex events influenced by many factors beyond raw team talent. Crowd support, travel fatigue, familiarity with the stadium, and referee decisions can all play meaningful roles in shaping match outcomes. One of the most consistent findings in sports analytics is the existence of home field advantage, where home teams tend to outperform away teams across a variety of metrics. In Project 1, we confirmed that this advantage exists in the English Premier League and that home teams generally score more goals, take more shots, and win more matches.
+
+In this project, we shift the focus from explanation to prediction. Instead of asking whether home teams perform better on average, we ask whether match outcomes can be predicted using observable match statistics. This is an important distinction, as prediction requires models that generalize well to unseen data rather than simply describing historical patterns. Understanding the predictive power of match statistics also has practical implications for betting markets, team preparation, and performance evaluation.
+
+Our main research question is therefore:
+
+**Can we accurately predict the outcome of soccer matches of the English Premier League?**
+
+We expect that home teams will perform better across key metrics and that these metrics can be used to predict outcomes with reasonable accuracy. By combining exploratory analysis with supervised learning techniques, this project provides a practical application of machine learning methods in a real-world sports context.
+
+# The Dataset
+
+```{r}
+results <- readr::read_csv(
+  "results.csv",
+  locale = readr::locale(encoding = "latin1")
+)
+
+glimpse(results)
+summary(results)
+```
+
+We use the *English Premier League (EPL) Results* dataset available on Kaggle, which contains 11,113 matches played between the 1993–1994 and 2021–2022 seasons. The dataset includes both final outcomes and detailed in-game statistics, making it well suited for predictive modeling. Each observation corresponds to a single match and includes information on the teams involved, the date of the match, and various performance metrics.
+
+The variables capture offensive actions such as shots and shots on target, as well as defensive and disciplinary actions like fouls, yellow cards, and red cards. These features provide an objective summary of how each match unfolded and allow us to model outcomes based on what happened during the game rather than on subjective evaluations of team strength.
+
+```{r}
+model_data <- results %>%
+  dplyr::filter(!is.na(FTR)) %>%
+  dplyr::filter(!is.na(HS), !is.na(AS), !is.na(HST), !is.na(AST)) %>%
+  dplyr::mutate(
+    DateTime = lubridate::ymd_hms(DateTime, quiet = TRUE),
+    season_start = as.numeric(substr(Season, 1, 4)),
+    outcome_3class = factor(
+      FTR,
+      levels = c("H", "D", "A"),
+      labels = c("HomeWin", "Draw", "AwayWin")
+    ),
+    home_win = factor(
+      ifelse(FTR == "H", "HomeWin", "NotHomeWin"),
+      levels = c("NotHomeWin", "HomeWin")
+    )
+  )
+```
+
+# Exploratory Data Analysis
+
+To extend the exploratory analysis from Project 1, we focused more closely on attacking statistics, particularly shots and shots on target. These variables are closely linked to goal scoring and serve as reasonable proxies for offensive pressure. Intuitively, teams that create more shooting opportunities, especially high-quality ones, are more likely to score and ultimately win matches.
+
+The visualizations below show clear differences in shooting behavior across match outcomes. Home wins are generally associated with higher numbers of shots and shots on target, while away wins and draws tend to involve more balanced or lower attacking output. While these patterns do not guarantee a particular outcome, they suggest that attacking metrics are informative predictors and should play a central role in our models.
+
+## Distribution of Match Outcomes
+
+```{r}
+ggplot(model_data, aes(x = outcome_3class)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Match Outcomes",
+    x = "Result",
+    y = "Number of Matches"
+  )
+```
+
+## Shots vs Outcome (Boxplot)
+
+```{r}
+shots_long <- model_data %>%
+  dplyr::select(outcome_3class, HS, AS) %>%
+  tidyr::pivot_longer(cols = c(HS, AS),
+                      names_to = "side",
+                      values_to = "shots")
+
+ggplot(shots_long, aes(x = outcome_3class, y = shots, fill = side)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title = "Shots by Outcome and Side",
+    x = "Match Outcome",
+    y = "Shots"
+  )
+```
+
+## Correlation Matrix of Numeric Predictors
+
+```{r}
+num_vars <- model_data %>%
+  dplyr::select(HS, AS, HST, AST, HC, AC, HF, AF, HY, AY, HR, AR)
+
+GGally::ggcorr(
+  num_vars,
+  label = TRUE,
+  label_round = 2,
+  hjust = 0.8,
+  size = 3
+)
+```
+
+# Train/Test Split
+
+To evaluate our models fairly, we split the data into a training set and a test set using a 70/30 split. The training data are used to estimate model parameters, while the test data provide an unbiased assessment of predictive performance. This approach helps ensure that our results reflect generalizable patterns rather than overfitting to the historical data.
+
+```{r}
+set.seed(123)
+train_index <- caret::createDataPartition(model_data$home_win,
+                                          p = 0.7,
+                                          list = FALSE)
+
+train_data <- model_data[train_index, ]
+test_data  <- model_data[-train_index, ]
+```
+
+# Logistic Regression (Binary: HomeWin vs NotHomeWin)
+
+We first fit a logistic regression model to predict whether the home team wins or does not win a match. Logistic regression is a natural choice for binary classification problems and offers the advantage of interpretability. Model coefficients can be directly related to changes in win probability, making it easier to understand how different match statistics influence outcomes.
+
+After fitting an initial model, we applied stepwise selection using AIC to identify the most informative predictors. Shots on target emerged as the strongest predictors, which is consistent with both soccer intuition and our earlier findings. Other variables, such as corners and disciplinary actions, also contributed useful information, suggesting that sustained pressure and match control play important roles.
+
+## Fit Initial Model
+
+```{r}
+logit_full <- glm(
+  home_win ~ HS + AS + HST + AST +
+    HC + AC + HY + AY + HR + AR +
+    season_start,
+  data = train_data,
+  family = binomial
+)
+
+summary(logit_full)
+```
+
+## Optional Model Selection (stepAIC)
+
+```{r}
+logit_step <- MASS::stepAIC(logit_full, trace = FALSE)
+summary(logit_step)
+```
+
+## Predictions, Confusion Matrix & Accuracy
+
+```{r}
+test_data$pred_prob_home <- predict(logit_step,
+                                    newdata = test_data,
+                                    type = "response")
+
+test_data$pred_home_class <- ifelse(
+  test_data$pred_prob_home >= 0.5,
+  "HomeWin",
+  "NotHomeWin"
+) %>%
+  factor(levels = levels(test_data$home_win))
+
+cm_logit <- caret::confusionMatrix(
+  data = test_data$pred_home_class,
+  reference = test_data$home_win
+)
+cm_logit
+```
+
+## ROC Curve
+
+```{r}
+roc_obj <- pROC::roc(
+  response  = test_data$home_win,
+  predictor = test_data$pred_prob_home,
+  levels   = c("NotHomeWin", "HomeWin")
+)
+
+plot(roc_obj,
+     main = "ROC Curve – HomeWin vs NotHomeWin (Logistic Model)")
+pROC::auc(roc_obj)
+```
+
+The ROC curve shows that the logistic regression model has solid discriminative ability, with an AUC of 0.7613. Given the inherent randomness of soccer matches, this represents a strong level of performance for a model based only on match statistics.
+
+# Classification Tree (3-class: HomeWin / Draw / AwayWin)
+
+We also fit a classification tree model to predict three possible outcomes: home win, draw, or away win. This approach is appealing because it can capture nonlinear relationships and interactions between variables, and the resulting tree is easy to visualize and interpret.
+
+```{r}
+tree_model <- rpart(
+  outcome_3class ~ HS + AS + HST + AST +
+    HC + AC + HF + AF + HY + AY + HR + AR +
+    season_start,
+  data = train_data,
+  method = "class",
+  control = rpart.control(cp = 0.01, minsplit = 50)
+)
+
+printcp(tree_model)
+```
+
+```{r}
+rpart.plot(
+  tree_model,
+  main = "Classification Tree – Match Outcome",
+  type = 2,
+  extra = 104,
+  under = TRUE,
+  faclen = 0
+)
+```
+
+## Predictions & Confusion Matrix
+
+```{r}
+tree_pred_prob <- predict(tree_model, newdata = test_data, type = "prob")
+tree_pred_class <- predict(tree_model, newdata = test_data, type = "class")
+
+test_data$tree_pred_class <- tree_pred_class
+
+cm_tree <- caret::confusionMatrix(
+  data = test_data$tree_pred_class,
+  reference = test_data$outcome_3class
+)
+cm_tree
+```
+
+## Heatmap
+
+```{r}
+cm_df <- as.data.frame(cm_tree$table)
+
+ggplot(cm_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), fontface = "bold") +
+  labs(
+    title = "Classification Tree – Confusion Matrix",
+    x = "Predicted",
+    y = "Actual"
+  )
+```
+
+The classification tree highlights the importance of shots on target but struggles to accurately predict draws. This limitation likely reflects the fact that draws often occur in evenly matched games where match statistics are similar for both teams.
+
+# Conclusion
+
+Overall, the results highlight meaningful differences between the two modeling approaches. Match statistics, particularly shots on target, contain strong signals about match outcomes, and the logistic regression model captures these patterns in a reliable and interpretable way. When home teams consistently create high-quality scoring chances, their probability of winning increases substantially.
+
+The classification tree, while intuitive and easy to interpret, performs worse when predicting all three possible outcomes and has particular difficulty with draws. These findings suggest that while basic in-game statistics can explain a significant portion of match results, achieving higher predictive accuracy would likely require additional contextual information such as team strength, tactical choices, or player availability. In practice, logistic regression appears better suited for prediction-focused applications, while classification trees may be more useful for exploratory analysis and coaching insights.
